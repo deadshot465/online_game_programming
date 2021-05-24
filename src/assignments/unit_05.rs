@@ -5,7 +5,7 @@ use crate::bindings::Windows::Win32::Networking::WinSock::{
     SOCKET_ERROR, SOCK_STREAM, SOMAXCONN,
 };
 use crate::bindings::Windows::Win32::System::SystemServices::{CHAR, PSTR};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use winapi::shared::minwindef::MAKEWORD;
 use winapi::shared::ws2def::INADDR_ANY;
 use winapi::um::winsock2::INVALID_SOCKET;
@@ -52,7 +52,7 @@ unsafe fn check_socket_error(result: i32, msg: &str) -> bool {
 }
 
 struct ClientPool {
-    pub socket_clients: Vec<Arc<Mutex<Client>>>,
+    pub socket_clients: Vec<Arc<RwLock<Client>>>,
     pub socket_client_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -63,7 +63,7 @@ impl ClientPool {
         client_vec.resize_with(pool_size, || {
             let inner_client = client.clone();
             client.id += 1;
-            Arc::new(Mutex::new(inner_client))
+            Arc::new(RwLock::new(inner_client))
         });
         ClientPool {
             socket_clients: client_vec,
@@ -71,14 +71,20 @@ impl ClientPool {
         }
     }
 
-    pub fn find_empty_client(&mut self) -> Arc<Mutex<Client>> {
+    pub fn find_empty_client(&mut self) -> Arc<RwLock<Client>> {
         self.socket_clients
             .iter()
-            .find(|c| c.lock().expect("Failed to lock socket client.").socket.0 == INVALID_SOCKET)
+            .find(|c| {
+                c.try_read()
+                    .expect("Failed to lock socket client.")
+                    .socket
+                    .0
+                    == INVALID_SOCKET
+            })
             .cloned()
             .unwrap_or_else(|| {
                 self.socket_clients
-                    .push(Arc::new(Mutex::new(Client::default())));
+                    .push(Arc::new(RwLock::new(Client::default())));
                 self.socket_clients
                     .last()
                     .cloned()
@@ -88,74 +94,84 @@ impl ClientPool {
 
     pub unsafe fn start_messaging(
         &mut self,
-        socket_client: Arc<Mutex<Client>>,
+        socket_client: Arc<RwLock<Client>>,
         mut server_msg: String,
-        other_clients: Vec<Arc<Mutex<Client>>>,
+        other_clients: Vec<Arc<RwLock<Client>>>,
     ) {
         self.socket_client_threads.push(std::thread::spawn(move || {
-            let mut client_lock = socket_client.lock().expect("Failed to lock socket client.");
-            send(
-                &client_lock.socket,
-                PSTR(server_msg.as_mut_ptr()),
-                (server_msg.chars().count() as i32) + 1,
-                SEND_FLAGS(0),
-            );
-
-            let mut recv_buffer = [0_u8; BUFFER_SIZE];
-            loop {
-                let recv_size = recv(
-                    &client_lock.socket,
-                    PSTR(recv_buffer.as_mut_ptr()),
-                    recv_buffer.len() as i32,
-                    0,
-                );
-                let mut incoming_message =
-                    String::from_utf8_lossy(&recv_buffer[..(recv_size as usize)]).to_string();
-                println!("{}{}", RECV_PREFIX, &incoming_message);
-                if incoming_message.starts_with(":end") {
-                    println!("{}", "終了コマンドを受信しました\n");
-                    let mut bye_message = "Bye!\0".to_string();
-                    send(
-                        &client_lock.socket,
-                        PSTR(bye_message.as_mut_ptr()),
-                        bye_message.len() as i32,
-                        SEND_FLAGS(0),
-                    );
-                    break;
-                }
-
-                println!(
-                    "{} -> {}：{}\n",
-                    client_lock.id, client_lock.id, &incoming_message
-                );
+            {
+                let client_lock = socket_client.read().expect("Failed to lock socket client.");
                 send(
                     &client_lock.socket,
-                    PSTR(incoming_message.as_mut_ptr()),
-                    incoming_message.len() as i32,
+                    PSTR(server_msg.as_mut_ptr()),
+                    (server_msg.chars().count() as i32) + 1,
                     SEND_FLAGS(0),
                 );
+            }
 
-                for client in other_clients.iter() {
-                    let other_client_lock = client.lock().expect("Failed to lock client socket.");
-                    if other_client_lock.socket.0 == INVALID_SOCKET {
-                        continue;
+            let mut recv_buffer = [0_u8; BUFFER_SIZE];
+            'outer_loop: loop {
+                if let Ok(client_lock) = socket_client.try_read() {
+                    let recv_size = recv(
+                        &client_lock.socket,
+                        PSTR(recv_buffer.as_mut_ptr()),
+                        recv_buffer.len() as i32,
+                        0,
+                    );
+                    let mut incoming_message =
+                        String::from_utf8_lossy(&recv_buffer[..(recv_size as usize)]).to_string();
+                    println!("{}{}", RECV_PREFIX, &incoming_message);
+                    if incoming_message.starts_with(":end") {
+                        println!("{}", "終了コマンドを受信しました\n");
+                        let mut bye_message = "Bye!\0".to_string();
+                        send(
+                            &client_lock.socket,
+                            PSTR(bye_message.as_mut_ptr()),
+                            bye_message.len() as i32,
+                            SEND_FLAGS(0),
+                        );
+                        break 'outer_loop;
                     }
+
                     println!(
                         "{} -> {}：{}\n",
-                        client_lock.id, other_client_lock.id, &incoming_message
+                        client_lock.id, client_lock.id, &incoming_message
                     );
                     send(
-                        &other_client_lock.socket,
+                        &client_lock.socket,
                         PSTR(incoming_message.as_mut_ptr()),
                         incoming_message.len() as i32,
                         SEND_FLAGS(0),
                     );
+
+                    for client in other_clients.iter() {
+                        if let Ok(other_client_lock) = client.try_read() {
+                            if other_client_lock.socket.0 == INVALID_SOCKET {
+                                continue;
+                            }
+                            println!(
+                                "{} -> {}：{}\n",
+                                client_lock.id, other_client_lock.id, &incoming_message
+                            );
+                            send(
+                                &other_client_lock.socket,
+                                PSTR(incoming_message.as_mut_ptr()),
+                                incoming_message.len() as i32,
+                                SEND_FLAGS(0),
+                            );
+                        }
+                    }
                 }
             }
 
-            let result = closesocket(&client_lock.socket);
-            check_socket_error(result, "切断に失敗しました。");
-            client_lock.socket.0 = INVALID_SOCKET;
+            {
+                let mut client_lock = socket_client
+                    .try_write()
+                    .expect("Failed to lock socket client.");
+                let result = closesocket(&client_lock.socket);
+                check_socket_error(result, "切断に失敗しました。");
+                client_lock.socket.0 = INVALID_SOCKET;
+            }
         }));
     }
 }
@@ -222,7 +238,7 @@ pub unsafe fn unit_05() -> bool {
     loop {
         let client = client_pool.find_empty_client();
         let mut client_addr_size = CLIENT_ADDR_SIZE;
-        let mut client_lock = client.lock().expect("Failed to lock client socket.");
+        let mut client_lock = client.try_write().expect("Failed to lock client socket.");
         let accepted_socket = accept(
             &server_socket,
             &mut client_lock.addr as *mut _ as *mut SOCKADDR,
@@ -249,7 +265,7 @@ pub unsafe fn unit_05() -> bool {
             .socket_clients
             .clone()
             .into_iter()
-            .filter(|c| c.lock().expect("Failed to lock client socket.").id != client_id)
+            .filter(|c| c.try_read().expect("Failed to lock client socket.").id != client_id)
             .collect::<Vec<_>>();
         client_pool.start_messaging(client, server_msg.clone(), other_clients);
     }
