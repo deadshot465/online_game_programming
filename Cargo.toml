@@ -1,0 +1,14 @@
+[package]
+name = "online_game_programming"
+version = "0.1.0"
+authors = ["Chehui Chou <deadshot465@users.noreply.github.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+windows = "~0.10.0"
+winapi = { version = "~0.3", features = ["minwindef", "winsock2", "ws2def"] }
+
+[build-dependencies]
+windows = "~0.10.0"
